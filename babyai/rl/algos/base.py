@@ -1,10 +1,11 @@
 from abc import ABC, abstractmethod
 import torch
-import numpy
+import numpy as np
 
 from babyai.rl.format import default_preprocess_obss
 from babyai.rl.utils import DictList, ParallelEnv
 from babyai.rl.utils.supervised_losses import ExtraInfoCollector
+from babyai.utils.demos import load_demos, mission_to_demos
 
 
 class BaseAlgo(ABC):
@@ -52,6 +53,9 @@ class BaseAlgo(ABC):
         # Store parameters
 
         self.env = ParallelEnv(envs)
+        # Load demos
+        self.demos = load_demos("./demos/BabyAI-GoToLocal-v0.pkl")
+        self.demos = mission_to_demos(self.demos)
         self.acmodel = acmodel
         self.acmodel.train()
         self.num_frames_per_proc = num_frames_per_proc
@@ -130,6 +134,15 @@ class BaseAlgo(ABC):
         """
         for i in range(self.num_frames_per_proc):
             # Do one agent-environment interaction
+
+            # Load demos.
+            # TODO: this should be abstracted
+            # into the environment, not obs.
+            for obs in self.obs:
+                mission = obs["mission"]
+                randi = np.random.randint(len(self.demos[mission]))
+                demo = self.demos[mission][randi]
+                obs["demo"] = demo
 
             preprocessed_obs = self.preprocess_obss(self.obs, device=self.device)
             with torch.no_grad():

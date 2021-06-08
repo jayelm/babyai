@@ -3,6 +3,7 @@ import pickle
 
 from .. import utils
 import blosc
+from collections import defaultdict
 
 
 def get_demos_path(demos=None, env=None, origin=None, valid=False):
@@ -62,3 +63,11 @@ def transform_demos(demos):
             new_demo.append((obs, action, done))
         new_demos.append(new_demo)
     return new_demos
+
+
+def mission_to_demos(demos):
+    missions = defaultdict(list)
+    for demo in demos:
+        mission = demo[0]
+        missions[mission].append(demo)
+    return dict(missions)
