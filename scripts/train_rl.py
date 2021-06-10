@@ -45,6 +45,10 @@ parser.add_argument("--ppo-epochs", type=int, default=4,
                     help="number of epochs for PPO (default: 4)")
 parser.add_argument("--save-interval", type=int, default=50,
                     help="number of updates between two saves (default: 50, 0 means no saving)")
+parser.add_argument("--wandb", action="store_true",
+                    help="Log to wandb")
+parser.add_argument("--wandb_project_name", default="emergent-marl",
+                    help="wandb project name")
 args = parser.parse_args()
 
 utils.seed(args.seed)
@@ -81,6 +85,12 @@ args.model = args.model.format(**model_name_parts) if args.model else default_mo
 utils.configure_logging(args.model)
 logger = logging.getLogger(__name__)
 
+# wandb logging
+if args.wandb:
+    import wandb
+    wandb.init(project=args.wandb_project_name, config=args)
+    wandb.run.name = args.model
+
 # Define obss preprocessor
 if 'emb' in args.arch:
     obss_preprocessor = utils.IntObssPreprocessor(args.model, envs[0].observation_space, args.pretrained_model)
@@ -95,7 +105,7 @@ if acmodel is None:
     else:
         acmodel = ACModel(obss_preprocessor.obs_space, envs[0].action_space,
                           args.image_dim, args.memory_dim, args.instr_dim,
-                          not args.no_instr, args.instr_arch, not args.no_mem, args.arch)
+                          not args.no_instr, args.instr_arch, not args.no_mem, args.arch, gen_instr=True)
 
 obss_preprocessor.vocab.save()
 utils.save_model(acmodel, args.model)
@@ -215,6 +225,32 @@ while status['num_frames'] < args.frames:
                       "pL {: .3f} | vL {:.3f} | L {:.3f} | gN {:.3f} | ")
 
         logger.info(format_str.format(*data))
+        if args.wandb:
+            metric_names = (
+                'i',
+                'total_episodes',
+                'total_frames',
+                'fps',
+                'total_elapsed_time',
+                'return_mean',
+                'return_sd',
+                'return_min',
+                'return_max',
+                'success_mean',
+                'num_frames_mean',
+                'num_frames_sd',
+                'num_frames_min',
+                'num_frames_max',
+                'entropy',
+                'value',
+                'policy_loss',
+                'value_loss',
+                'loss',
+                'grad_norm',
+            )
+            assert len(metric_names) == len(data)
+            wandb.log(dict(zip(metric_names, data)))
+
         if args.tb:
             assert len(header) == len(data)
             for key, value in zip(header, data):
