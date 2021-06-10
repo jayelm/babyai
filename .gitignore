@@ -113,3 +113,7 @@ storage/
 *.csv
 *.pt
 *.json
+
+demos
+demos/
+wandb/
