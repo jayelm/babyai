@@ -6,6 +6,7 @@ from torch.distributions.categorical import Categorical
 from torch.nn.utils.rnn import pack_padded_sequence, pad_packed_sequence
 import babyai.rl
 from babyai.rl.utils.supervised_losses import required_heads
+from babyai.teacher import Teacher
 
 
 # From https://github.com/ikostrikov/pytorch-a2c-ppo-acktr/blob/master/model.py
@@ -63,8 +64,11 @@ class ACModel(nn.Module, babyai.rl.RecurrentACModel):
     def __init__(self, obs_space, action_space,
                  image_dim=128, memory_dim=128, instr_dim=128,
                  use_instr=False, lang_model="gru", use_memory=False,
-                 arch="bow_endpool_res", aux_info=None):
+                 arch="bow_endpool_res", aux_info=None, gen_instr=False, teacher_vocab_size=20, teacher_max_len=7):
         super().__init__()
+
+        if gen_instr and not use_instr:
+            raise ValueError("gen_instr=True requires use_instr=True")
 
         endpool = 'endpool' in arch
         use_bow = 'bow' in arch
@@ -73,7 +77,9 @@ class ACModel(nn.Module, babyai.rl.RecurrentACModel):
 
         # Decide which components are enabled
         self.use_instr = use_instr
+        self.gen_instr = gen_instr
         self.use_memory = use_memory
+        self.teacher_max_len = teacher_max_len  # This includes SOS/EOS!
         self.arch = arch
         self.lang_model = lang_model
         self.aux_info = aux_info
@@ -112,7 +118,11 @@ class ACModel(nn.Module, babyai.rl.RecurrentACModel):
         # Define instruction embedding
         if self.use_instr:
             if self.lang_model in ['gru', 'bigru', 'attgru']:
-                self.word_embedding = nn.Embedding(obs_space["instr"], self.instr_dim)
+                if self.gen_instr:
+                    n_word = teacher_vocab_size + 3
+                else:
+                    n_word = obs_space["instr"]
+                self.word_embedding = nn.Embedding(n_word, self.instr_dim)
                 if self.lang_model in ['gru', 'bigru', 'attgru']:
                     gru_dim = self.instr_dim
                     if self.lang_model in ['bigru', 'attgru']:
@@ -140,6 +150,12 @@ class ACModel(nn.Module, babyai.rl.RecurrentACModel):
                     in_channels=128, imm_channels=128)
                 self.controllers.append(mod)
                 self.add_module('FiLM_' + str(ni), mod)
+
+        if self.gen_instr:
+            # Instruction generation from demo
+            #  self.teacher_vocab = 
+            # Add +3 for sos/eos/pad
+            self.teacher = Teacher(4 + 3, action_space.n + 3, teacher_vocab_size + 3)
 
         # Define memory and resize image embedding
         self.embedding_size = self.image_dim
@@ -214,9 +230,22 @@ class ACModel(nn.Module, babyai.rl.RecurrentACModel):
     def semi_memory_size(self):
         return self.memory_dim
 
-    def forward(self, obs, memory, instr_embedding=None):
+    def sample_from_teacher(self, demos):
+        return self.teacher.sample(
+            demos["obs"].float(),
+            demos["dirs"],
+            demos["acts"],
+            demos["obs_lens"],
+            max_len=self.teacher_max_len
+        )
+
+    def forward(self, obs, memory, instr_embedding=None, instr=None, instr_len=None):
+        if self.use_instr and instr is None:
+            instr = obs.instr
+            instr_len = None
+
         if self.use_instr and instr_embedding is None:
-            instr_embedding = self._get_instr_embedding(obs.instr)
+            instr_embedding = self._get_instr_embedding(instr, lengths=instr_len)
         if self.use_instr and self.lang_model == "attgru":
             # outputs: B x L x D
             # memory: B x M
@@ -272,10 +301,15 @@ class ACModel(nn.Module, babyai.rl.RecurrentACModel):
 
         return {'dist': dist, 'value': value, 'memory': memory, 'extra_predictions': extra_predictions}
 
-    def _get_instr_embedding(self, instr):
-        lengths = (instr != 0).sum(1).long()
+    def _get_instr_embedding(self, instr, lengths=None):
+        if lengths is None:
+            lengths = (instr != 0).sum(1).long()
         if self.lang_model == 'gru':
-            out, _ = self.instr_rnn(self.word_embedding(instr))
+            if instr.ndim == 3:  # One-hot
+                instr_emb = instr @ self.word_embedding.weight
+            else:
+                instr_emb = self.word_embedding(instr)
+            out, _ = self.instr_rnn(instr_emb)
             hidden = out[range(len(lengths)), lengths-1, :]
             return hidden
 

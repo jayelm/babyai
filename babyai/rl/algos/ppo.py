@@ -2,6 +2,8 @@ import numpy
 import torch
 import torch.nn.functional as F
 
+torch.autograd.set_detect_anomaly(True)
+
 
 from babyai.rl.algos.base import BaseAlgo
 
@@ -65,7 +67,9 @@ class PPOAlgo(BaseAlgo):
             list of frames is random thanks to self._get_batches_starting_indexes().
             '''
 
-            for inds in self._get_batches_starting_indexes():
+            batch_idxs = self._get_batches_starting_indexes()
+            for batch_i, inds in enumerate(batch_idxs):
+                is_last_batch = batch_i == len(batch_idxs) - 1
                 # inds is a numpy array of indices that correspond to the beginning of a sub-batch
                 # there are as many inds as there are batches
                 # Initialize batch values
@@ -85,8 +89,12 @@ class PPOAlgo(BaseAlgo):
                     sb = exps[inds + i]
 
                     # Compute loss
-
-                    model_results = self.acmodel(sb.obs, memory * sb.mask)
+                    model_results = self.acmodel(
+                        sb.obs,
+                        memory * sb.mask,
+                        instr=sb.instr,
+                        instr_len=sb.instr_len,
+                    )
                     dist = model_results['dist']
                     value = model_results['value']
                     memory = model_results['memory']

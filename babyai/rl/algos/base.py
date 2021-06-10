@@ -5,7 +5,8 @@ import numpy as np
 from babyai.rl.format import default_preprocess_obss
 from babyai.rl.utils import DictList, ParallelEnv
 from babyai.rl.utils.supervised_losses import ExtraInfoCollector
-from babyai.utils.demos import load_demos, mission_to_demos
+from babyai.utils.demos import load_demos, mission_to_demos, Demos
+from babyai.utils.format import DemoPreprocessor
 
 
 class BaseAlgo(ABC):
@@ -54,8 +55,8 @@ class BaseAlgo(ABC):
 
         self.env = ParallelEnv(envs)
         # Load demos
-        self.demos = load_demos("./demos/BabyAI-GoToLocal-v0.pkl")
-        self.demos = mission_to_demos(self.demos)
+        self.demos = Demos(load_demos("./demos/BabyAI-GoToLocal-v0.pkl"))
+        self.demo_preproc = DemoPreprocessor()
         self.acmodel = acmodel
         self.acmodel.train()
         self.num_frames_per_proc = num_frames_per_proc
@@ -111,6 +112,24 @@ class BaseAlgo(ABC):
         self.log_reshaped_return = [0] * self.num_procs
         self.log_num_frames = [0] * self.num_procs
 
+    def generate_instructions(self):
+        obs_missions = []
+        demos = []
+        for obs in self.obs:
+            mission = obs["mission"]
+            obs_missions.append(mission)
+
+            # Choose random demo
+            randi = np.random.randint(len(self.demos.missions2demos[mission]))
+            demo = self.demos.missions2demos[mission][randi]
+            demos.append(demo)
+
+        # Preprocess demos
+        demos = self.demo_preproc(demos, device=self.device)
+
+        instr, instr_len = self.acmodel.sample_from_teacher(demos)
+        return instr, instr_len
+
     def collect_experiences(self):
         """Collects rollouts and computes advantages.
 
@@ -132,21 +151,27 @@ class BaseAlgo(ABC):
             reward, policy loss, value loss, etc.
 
         """
+        if self.acmodel.gen_instr:
+            # Generate instructions, fixing teacher parameters.
+            with torch.no_grad():
+                instr, instr_len = self.generate_instructions()
+        else:
+            instr = None
+            instr_len = None
+
         for i in range(self.num_frames_per_proc):
             # Do one agent-environment interaction
 
             # Load demos.
             # TODO: this should be abstracted
             # into the environment, not obs.
-            for obs in self.obs:
-                mission = obs["mission"]
-                randi = np.random.randint(len(self.demos[mission]))
-                demo = self.demos[mission][randi]
-                obs["demo"] = demo
+            # FIXME - I *believe* obs should be the same each time.
 
             preprocessed_obs = self.preprocess_obss(self.obs, device=self.device)
             with torch.no_grad():
-                model_results = self.acmodel(preprocessed_obs, self.memory * self.mask.unsqueeze(1))
+                # Why is there no gradient here?
+                # FIXME: this is wasteful as we should save the processed instr embedding each time, ideally
+                model_results = self.acmodel(preprocessed_obs, self.memory * self.mask.unsqueeze(1), instr=instr, instr_len=instr_len)
                 dist = model_results['dist']
                 value = model_results['value']
                 memory = model_results['memory']
@@ -204,7 +229,7 @@ class BaseAlgo(ABC):
 
         preprocessed_obs = self.preprocess_obss(self.obs, device=self.device)
         with torch.no_grad():
-            next_value = self.acmodel(preprocessed_obs, self.memory * self.mask.unsqueeze(1))['value']
+            next_value = self.acmodel(preprocessed_obs, self.memory * self.mask.unsqueeze(1), instr=instr, instr_len=instr_len)['value']
 
         for i in reversed(range(self.num_frames_per_proc)):
             next_mask = self.masks[i+1] if i < self.num_frames_per_proc - 1 else self.mask
@@ -221,6 +246,7 @@ class BaseAlgo(ABC):
         exps.obs = [self.obss[i][j]
                     for j in range(self.num_procs)
                     for i in range(self.num_frames_per_proc)]
+
         # In commments below T is self.num_frames_per_proc, P is self.num_procs,
         # D is the dimensionality
 
@@ -243,6 +269,11 @@ class BaseAlgo(ABC):
         # Preprocess experiences
 
         exps.obs = self.preprocess_obss(exps.obs, device=self.device)
+        # L = sequence length
+        # P x L x D... -> P x 1 x L x D... -> P x T x L x D... (expand) -> (P * T) x L x D
+        exps.instr = instr.unsqueeze(1).expand(-1, self.num_frames_per_proc, -1, -1).reshape(-1, instr.shape[1], instr.shape[2])
+        # P -> P x 1 -> P x T -> P * T
+        exps.instr_len = instr_len.unsqueeze(1).expand(-1, self.num_frames_per_proc).reshape(-1)
 
         # Log some values
 

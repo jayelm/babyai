@@ -122,6 +122,8 @@ class Level_GoToLocal(RoomGridLevel):
         self.check_objs_reachable()
         obj = self._rand_elem(objs)
         self.instrs = GoToInstr(ObjDesc(obj.type, obj.color))
+        # Load corresponding demo
+        pass
 
 
 class Level_GoToLocalS5N2(Level_GoToLocal):

@@ -4,6 +4,7 @@ import numpy
 import re
 import torch
 import babyai.rl
+from torch.nn.utils.rnn import pad_sequence
 
 from .. import utils
 
@@ -43,6 +44,7 @@ class Vocabulary:
 
 class InstructionsPreprocessor(object):
     def __init__(self, model_name, load_vocab_from=None):
+        # FIXME - you may need to make this more like the emcomm vocab (SOS, EOS, etc)
         self.model_name = model_name
         self.vocab = Vocabulary(model_name)
 
@@ -73,6 +75,46 @@ class InstructionsPreprocessor(object):
 
         instrs = torch.tensor(instrs, device=device, dtype=torch.long)
         return instrs
+
+
+def demo_collate(batch):
+    obs, dirs, acts, obs_lens, langs, lang_lens = zip(*batch)
+    obs_lens = torch.tensor(obs_lens)
+    lang_lens = torch.tensor(lang_lens)
+    obs_pad = pad_sequence(obs, batch_first=True, padding_value=0)
+    dirs_pad = pad_sequence(dirs, batch_first=True, padding_value=0)
+    acts_pad = pad_sequence(acts, batch_first=True, padding_value=0)
+    langs_pad = pad_sequence(langs, batch_first=True, padding_value=0)
+    return {
+        "obs": obs_pad,
+        "dirs": dirs_pad,
+        "acts": acts_pad,
+        "obs_lens": obs_lens,
+        "langs": langs_pad,
+        "lang_lens": lang_lens,
+    }
+
+
+class DemoPreprocessor(object):
+    def __init__(self):
+        pass
+
+    def __call__(self, demos, device=None):
+        demo_tpls = []
+        for demo in demos:
+            demo_tpl = (
+                demo["obs"],
+                demo["dirs"],
+                demo["acts"],
+                demo["obs_len"],
+                demo["lang"],
+                demo["lang_len"],
+            )
+            demo_tpls.append(demo_tpl)
+
+        demo_proc = demo_collate(demo_tpls)
+        demo_proc = {k: t.to(device) for k, t in demo_proc.items()}
+        return demo_proc
 
 
 class RawImagePreprocessor(object):
