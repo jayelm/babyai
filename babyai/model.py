@@ -344,3 +344,25 @@ class ACModel(nn.Module, babyai.rl.RecurrentACModel):
 
         else:
             ValueError("Undefined instruction architecture: {}".format(self.use_instr))
+
+    def teacher_parameters(self):
+        for name, param in self.named_parameters():
+            if name.startswith("teacher."):
+                yield param
+
+    def student_parameters(self):
+        for name, param in self.named_parameters():
+            if not name.startswith("teacher."):
+                yield param
+
+    def freeze_teacher(self):
+        for param in self.teacher_parameters():
+            param.requires_grad = False
+        for param in self.student_parameters():
+            param.requires_grad = True
+
+    def freeze_student(self):
+        for param in self.teacher_parameters():
+            param.requires_grad = True
+        for param in self.student_parameters():
+            param.requires_grad = False

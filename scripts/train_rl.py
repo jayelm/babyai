@@ -194,35 +194,37 @@ while status['num_frames'] < args.frames:
     # Update parameters
 
     update_start_time = time.time()
-    logs = algo.update_parameters()
+    student_logs = algo.update_student_parameters()
+    teacher_logs = algo.update_teacher_parameters()
     update_end_time = time.time()
 
-    status['num_frames'] += logs["num_frames"]
-    status['num_episodes'] += logs['episodes_done']
+    status['num_frames'] += student_logs["num_frames"]
+    status['num_episodes'] += student_logs['episodes_done']
     status['i'] += 1
 
     # Print logs
 
     if status['i'] % args.log_interval == 0:
         total_ellapsed_time = int(time.time() - total_start_time)
-        fps = logs["num_frames"] / (update_end_time - update_start_time)
+        fps = student_logs["num_frames"] / (update_end_time - update_start_time)
         duration = datetime.timedelta(seconds=total_ellapsed_time)
-        return_per_episode = utils.synthesize(logs["return_per_episode"])
+        return_per_episode = utils.synthesize(student_logs["return_per_episode"])
         success_per_episode = utils.synthesize(
-            [1 if r > 0 else 0 for r in logs["return_per_episode"]])
-        num_frames_per_episode = utils.synthesize(logs["num_frames_per_episode"])
+            [1 if r > 0 else 0 for r in student_logs["return_per_episode"]])
+        num_frames_per_episode = utils.synthesize(student_logs["num_frames_per_episode"])
 
         data = [status['i'], status['num_episodes'], status['num_frames'],
                 fps, total_ellapsed_time,
                 *return_per_episode.values(),
                 success_per_episode['mean'],
                 *num_frames_per_episode.values(),
-                logs["entropy"], logs["value"], logs["policy_loss"], logs["value_loss"],
-                logs["loss"], logs["grad_norm"]]
+                student_logs["entropy"], student_logs["value"], student_logs["policy_loss"], student_logs["value_loss"],
+                student_logs["loss"], student_logs["grad_norm"],
+                teacher_logs["loss"], teacher_logs["grad_norm"]]
 
         format_str = ("U {} | E {} | F {:06} | FPS {:04.0f} | D {} | R:xsmM {: .2f} {: .2f} {: .2f} {: .2f} | "
                       "S {:.2f} | F:xsmM {:.1f} {:.1f} {} {} | H {:.3f} | V {:.3f} | "
-                      "pL {: .3f} | vL {:.3f} | L {:.3f} | gN {:.3f} | ")
+                      "pL {: .3f} | vL {:.3f} | L {:.3f} | gN {:.3f} | T_L {:.3f} T_gN {:.3f}")
 
         logger.info(format_str.format(*data))
         if args.wandb:
@@ -245,8 +247,10 @@ while status['num_frames'] < args.frames:
                 'value',
                 'policy_loss',
                 'value_loss',
-                'loss',
-                'grad_norm',
+                'student_loss',
+                'student_grad_norm',
+                'teacher_loss',
+                'teacher_grad_norm',
             )
             assert len(metric_names) == len(data)
             wandb.log(dict(zip(metric_names, data)))
@@ -270,10 +274,10 @@ while status['num_frames'] < args.frames:
         agent = ModelAgent(args.model, obss_preprocessor, argmax=True)
         agent.model = acmodel
         agent.model.eval()
-        logs = batch_evaluate(agent, test_env_name, args.val_seed, args.val_episodes, pixel=use_pixel)
+        student_logs = batch_evaluate(agent, test_env_name, args.val_seed, args.val_episodes, pixel=use_pixel)
         agent.model.train()
-        mean_return = np.mean(logs["return_per_episode"])
-        success_rate = np.mean([1 if r > 0 else 0 for r in logs['return_per_episode']])
+        mean_return = np.mean(student_logs["return_per_episode"])
+        success_rate = np.mean([1 if r > 0 else 0 for r in student_logs['return_per_episode']])
         save_model = False
         if success_rate > best_success_rate:
             best_success_rate = success_rate

@@ -16,7 +16,7 @@ class PPOAlgo(BaseAlgo):
                  gae_lambda=0.95,
                  entropy_coef=0.01, value_loss_coef=0.5, max_grad_norm=0.5, recurrence=4,
                  adam_eps=1e-5, clip_eps=0.2, epochs=4, batch_size=256, preprocess_obss=None,
-                 reshape_reward=None, aux_info=None):
+                 reshape_reward=None, aux_info=None, teacher_lr=None):
         num_frames_per_proc = num_frames_per_proc or 128
 
         super().__init__(envs, acmodel, num_frames_per_proc, discount, lr, gae_lambda, entropy_coef,
@@ -29,13 +29,59 @@ class PPOAlgo(BaseAlgo):
 
         assert self.batch_size % self.recurrence == 0
 
-        self.optimizer = torch.optim.Adam(self.acmodel.parameters(), lr, (beta1, beta2), eps=adam_eps)
+        if teacher_lr is None:
+            teacher_lr = lr
+        self.student_optimizer = torch.optim.Adam(self.acmodel.student_parameters(), lr, (beta1, beta2), eps=adam_eps)
+        self.teacher_optimizer = torch.optim.Adam(self.acmodel.teacher_parameters(), teacher_lr, (beta1, beta2), eps=adam_eps)
         self.batch_num = 0
 
-    def update_parameters(self):
+    def update_teacher_parameters(self):
+        self.acmodel.freeze_student()
         # Collect experiences
 
-        exps, logs = self.collect_experiences()
+        # Here we train teacher generation network to maximize student reward,
+        # assuming fixed student reward func. This means we do backprop on
+        # entire batches of instructions, rather than on batches of frames.
+        # TODO: probably make batch size/epochs smaller.
+        # FIXME: is it ok that we detach advantages?
+        for epoch_i in range(self.epochs):
+            exps, logs = self.collect_experiences_for_teacher()
+            # Initialize log values
+
+            #  log_entropies = []
+            #  log_values = []
+            #  log_policy_losses = []
+            #  log_value_losses = []
+            log_grad_norms = []
+            log_losses = []
+
+            teacher_loss = -exps.returnn.mean()
+            self.teacher_optimizer.zero_grad()
+            teacher_loss.backward()
+            grad_norm = sum(p.grad.data.norm(2) ** 2 for p in self.acmodel.teacher_parameters() if p.grad is not None) ** 0.5
+            torch.nn.utils.clip_grad_norm_(self.acmodel.teacher_parameters(), self.max_grad_norm)
+            self.teacher_optimizer.step()
+
+            # Update log values
+            # Is it that the obs are partial...? need to detach obs? make sure everything is detached has no grad fn
+
+            #  log_entropies.append(batch_entropy)
+            #  log_values.append(batch_value)
+            #  log_policy_losses.append(batch_policy_loss)
+            #  log_value_losses.append(batch_value_loss)
+            log_grad_norms.append(grad_norm.item())
+            log_losses.append(teacher_loss.item())
+
+        # Log some values
+        logs["loss"] = numpy.mean(log_losses)
+
+        return logs
+
+    def update_student_parameters(self):
+        self.acmodel.freeze_teacher()
+        # Collect experiences
+
+        exps, logs = self.collect_experiences_for_student()
         '''
         exps is a DictList with the following keys ['obs', 'memory', 'mask', 'action', 'value', 'reward',
          'advantage', 'returnn', 'log_prob'] and ['collected_info', 'extra_predictions'] if we use aux_info
@@ -69,7 +115,6 @@ class PPOAlgo(BaseAlgo):
 
             batch_idxs = self._get_batches_starting_indexes()
             for batch_i, inds in enumerate(batch_idxs):
-                is_last_batch = batch_i == len(batch_idxs) - 1
                 # inds is a numpy array of indices that correspond to the beginning of a sub-batch
                 # there are as many inds as there are batches
                 # Initialize batch values
@@ -137,11 +182,11 @@ class PPOAlgo(BaseAlgo):
 
                 # Update actor-critic
 
-                self.optimizer.zero_grad()
+                self.student_optimizer.zero_grad()
                 batch_loss.backward()
-                grad_norm = sum(p.grad.data.norm(2) ** 2 for p in self.acmodel.parameters() if p.grad is not None) ** 0.5
-                torch.nn.utils.clip_grad_norm_(self.acmodel.parameters(), self.max_grad_norm)
-                self.optimizer.step()
+                grad_norm = sum(p.grad.data.norm(2) ** 2 for p in self.acmodel.student_parameters() if p.grad is not None) ** 0.5
+                torch.nn.utils.clip_grad_norm_(self.acmodel.student_parameters(), self.max_grad_norm)
+                self.student_optimizer.step()
 
                 # Update log values
 
