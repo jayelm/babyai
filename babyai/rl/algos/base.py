@@ -151,6 +151,11 @@ class BaseAlgo(ABC):
             reward, policy loss, value loss, etc.
 
         """
+        self.memory = self.memory.detach()
+        self.memories = self.memories.detach()
+        self.log_probs = self.log_probs.detach()
+        self.advantages = self.advantages.detach()
+        self.values = self.values.detach()
         if self.acmodel.gen_instr:
             # Generate instructions, fixing teacher parameters.
             with torch.no_grad():
@@ -301,7 +306,10 @@ class BaseAlgo(ABC):
 
         Or, idea is to train teacher network to maximize return?
         """
+        # Detach old gradients leading up to this memory
         self.memory = self.memory.detach()
+        self.memories = self.memories.detach()
+        self.log_probs = self.log_probs.detach()
         self.advantages = self.advantages.detach()
         self.values = self.values.detach()
         if self.acmodel.gen_instr:
