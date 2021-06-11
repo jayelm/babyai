@@ -74,6 +74,7 @@ class PPOAlgo(BaseAlgo):
 
         # Log some values
         logs["loss"] = numpy.mean(log_losses)
+        logs["grad_norm"] = numpy.mean(log_grad_norms)
 
         return logs
 
