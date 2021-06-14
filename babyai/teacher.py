@@ -128,7 +128,6 @@ class LanguageDecoder(nn.Module):
             if done_sampling.all():
                 break
             outputs, states = self.gru(inputs, states)  # outputs: (L=1,B,H)
-            outputs = outputs.squeeze(0)  # outputs: (B,H)
             outputs = self.dense(outputs)  # outputs: (B,V)
 
             if greedy:
