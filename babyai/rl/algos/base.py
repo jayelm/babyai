@@ -1,6 +1,7 @@
 from abc import ABC, abstractmethod
 import torch
 import numpy as np
+import contextlib
 
 from babyai.rl.format import default_preprocess_obss
 from babyai.rl.utils import DictList, ParallelEnv
@@ -86,6 +87,8 @@ class BaseAlgo(ABC):
 
         self.obs = self.env.reset()
         self.obss = [None]*(shape[0])
+        self.instrs = [None]*(shape[0])
+        self.instrs_lens = [None]*(shape[0])
 
         self.memory = torch.zeros(shape[1], self.acmodel.memory_size, device=self.device)
         self.memories = torch.zeros(*shape, self.acmodel.memory_size, device=self.device)
@@ -112,10 +115,17 @@ class BaseAlgo(ABC):
         self.log_reshaped_return = [0] * self.num_procs
         self.log_num_frames = [0] * self.num_procs
 
-    def generate_instructions(self):
+    def generate_instructions(self, mask=None):
+        """
+        Mask here is 0 if environment is done and we need to resample.
+        """
         obs_missions = []
         demos = []
-        for obs in self.obs:
+        if mask is None:
+            mask = [0 for _ in self.obs]
+        for mask_value, obs in zip(mask, self.obs):
+            if mask_value:
+                continue
             mission = obs["mission"]
             obs_missions.append(mission)
 
@@ -130,12 +140,24 @@ class BaseAlgo(ABC):
         instr, instr_len = self.acmodel.sample_from_teacher(demos)
         return instr, instr_len
 
-    def collect_experiences_for_student(self):
+    def detach_old(self):
+        self.memory = self.memory.detach()
+        self.memories = self.memories.detach()
+        self.log_probs = self.log_probs.detach()
+        self.advantages = self.advantages.detach()
+        self.values = self.values.detach()
+
+    def collect_experiences(self, mode):
         """Collects rollouts and computes advantages.
 
         Runs several environments concurrently. The next actions are computed
         in a batch mode for all environments at the same time. The rollouts
         and advantages from all environments are concatenated together.
+
+        Params
+        ------
+        mode : str (one of 'student', 'teacher')
+            which mode to run in
 
         Returns
         -------
@@ -151,14 +173,21 @@ class BaseAlgo(ABC):
             reward, policy loss, value loss, etc.
 
         """
-        self.memory = self.memory.detach()
-        self.memories = self.memories.detach()
-        self.log_probs = self.log_probs.detach()
-        self.advantages = self.advantages.detach()
-        self.values = self.values.detach()
+        if mode not in ['student', 'teacher']:
+            raise ValueError(f"unknown mode {mode}")
+
+        self.detach_old()
+
+        # if mode == 'student', no gradients calculated, since we're
+        # just collecting experience.  if mode == 'teacher', we're
+        # explicitly trying to optimize teacher parameters. student
+        # params are frozen but gradients are calculated all the way
+        # through.
+        context = torch.no_grad if mode == 'student' else contextlib.nullcontext
+
         if self.acmodel.gen_instr:
             # Generate instructions, fixing teacher parameters.
-            with torch.no_grad():
+            with context():
                 instr, instr_len = self.generate_instructions()
         else:
             instr = None
@@ -173,30 +202,36 @@ class BaseAlgo(ABC):
             # FIXME - I *believe* obs should be the same each time.
 
             preprocessed_obs = self.preprocess_obss(self.obs, device=self.device)
-            with torch.no_grad():
+            with context():
                 model_results = self.acmodel(preprocessed_obs, self.memory * self.mask.unsqueeze(1), instr=instr, instr_len=instr_len)
                 dist = model_results['dist']
                 value = model_results['value']
                 memory = model_results['memory']
                 extra_predictions = model_results['extra_predictions']
 
-            action = dist.sample()
+            if mode == 'student':
+                action = dist.sample()
+            else:
+                # Deterministic
+                action = dist.logits.argmax(1)
 
             obs, reward, done, env_info = self.env.step(action.cpu().numpy())
             if self.aux_info:
                 env_info = self.aux_info_collector.process(env_info)
-                # env_info = self.process_aux_info(env_info)
 
             # Update experiences values
 
             self.obss[i] = self.obs
-            self.obs = obs
+            self.instrs[i] = instr
+            self.instrs_lens[i] = instr_len
 
             self.memories[i] = self.memory
             self.memory = memory
 
             self.masks[i] = self.mask
             self.mask = 1 - torch.tensor(done, device=self.device, dtype=torch.float)
+            mask_bool = self.mask.bool()
+
             self.actions[i] = action
             self.values[i] = value
             if self.reshape_reward is not None:
@@ -228,10 +263,22 @@ class BaseAlgo(ABC):
             self.log_episode_reshaped_return *= self.mask
             self.log_episode_num_frames *= self.mask
 
+            if not mask_bool.all():
+                # Resample instructions where done
+                with context():
+                    new_instr, new_instr_len = self.generate_instructions(mask=mask_bool)
+                    new_instr_padded = torch.zeros_like(instr)
+                    new_instr_padded[~mask_bool] = new_instr
+                    new_instr_len_padded = torch.zeros_like(instr_len)
+                    new_instr_len_padded[~mask_bool] = new_instr_len
+
+                    instr = torch.where(mask_bool.unsqueeze(1).unsqueeze(1), instr, new_instr_padded)
+                    instr_len = torch.where(mask_bool, instr_len, new_instr_len_padded)
+
         # Add advantage and return to experiences
 
         preprocessed_obs = self.preprocess_obss(self.obs, device=self.device)
-        with torch.no_grad():
+        with context():
             next_value = self.acmodel(preprocessed_obs, self.memory * self.mask.unsqueeze(1), instr=instr, instr_len=instr_len)['value']
 
         for i in reversed(range(self.num_frames_per_proc)):
@@ -273,159 +320,10 @@ class BaseAlgo(ABC):
 
         exps.obs = self.preprocess_obss(exps.obs, device=self.device)
         # L = sequence length
-        # P x L x D... -> P x 1 x L x D... -> P x T x L x D... (expand) -> (P * T) x L x D
-        exps.instr = instr.unsqueeze(1).expand(-1, self.num_frames_per_proc, -1, -1).reshape(-1, instr.shape[1], instr.shape[2])
-        # P -> P x 1 -> P x T -> P * T
-        exps.instr_len = instr_len.unsqueeze(1).expand(-1, self.num_frames_per_proc).reshape(-1)
-
-        # Log some values
-
-        keep = max(self.log_done_counter, self.num_procs)
-
-        log = {
-            "return_per_episode": self.log_return[-keep:],
-            "reshaped_return_per_episode": self.log_reshaped_return[-keep:],
-            "num_frames_per_episode": self.log_num_frames[-keep:],
-            "num_frames": self.num_frames,
-            "episodes_done": self.log_done_counter,
-        }
-
-        self.log_done_counter = 0
-        self.log_return = self.log_return[-self.num_procs:]
-        self.log_reshaped_return = self.log_reshaped_return[-self.num_procs:]
-        self.log_num_frames = self.log_num_frames[-self.num_procs:]
-
-        return exps, log
-
-    def collect_experiences_for_teacher(self):
-        """
-        Sample language from teacher via gumbel softmax, then compute
-        rollouts assuming fixed agent.  Idea is to backpropagate through
-        actions leading to positive reward, updating the teacher
-        language generation policy.
-
-        Or, idea is to train teacher network to maximize return?
-        """
-        # Detach old gradients leading up to this memory
-        self.memory = self.memory.detach()
-        self.memories = self.memories.detach()
-        self.log_probs = self.log_probs.detach()
-        self.advantages = self.advantages.detach()
-        self.values = self.values.detach()
-        if self.acmodel.gen_instr:
-            # Generate instructions, fixing teacher parameters.
-            instr, instr_len = self.generate_instructions()
-        else:
-            instr = None
-            instr_len = None
-
-        for i in range(self.num_frames_per_proc):
-            # Do one agent-environment interaction
-
-            preprocessed_obs = self.preprocess_obss(self.obs, device=self.device)
-            model_results = self.acmodel(preprocessed_obs, self.memory * self.mask.unsqueeze(1), instr=instr, instr_len=instr_len)
-            dist = model_results['dist']
-            value = model_results['value']
-            memory = model_results['memory']
-            extra_predictions = model_results['extra_predictions']
-
-            # deterministic
-            action = dist.logits.argmax(1)
-
-            obs, reward, done, env_info = self.env.step(action.cpu().numpy())
-            if self.aux_info:
-                env_info = self.aux_info_collector.process(env_info)
-                # env_info = self.process_aux_info(env_info)
-
-            # Update experiences values
-
-            self.obss[i] = self.obs
-            self.obs = obs
-
-            self.memories[i] = self.memory
-            self.memory = memory
-
-            self.masks[i] = self.mask
-            self.mask = 1 - torch.tensor(done, device=self.device, dtype=torch.float)
-            self.actions[i] = action
-            self.values[i] = value
-            if self.reshape_reward is not None:
-                self.rewards[i] = torch.tensor([
-                    self.reshape_reward(obs_, action_, reward_, done_)
-                    for obs_, action_, reward_, done_ in zip(obs, action, reward, done)
-                ], device=self.device)
-            else:
-                self.rewards[i] = torch.tensor(reward, device=self.device)
-            self.log_probs[i] = dist.log_prob(action)
-
-            if self.aux_info:
-                self.aux_info_collector.fill_dictionaries(i, env_info, extra_predictions)
-
-            # Update log values
-
-            self.log_episode_return += torch.tensor(reward, device=self.device, dtype=torch.float)
-            self.log_episode_reshaped_return += self.rewards[i]
-            self.log_episode_num_frames += torch.ones(self.num_procs, device=self.device)
-
-            for i, done_ in enumerate(done):
-                if done_:
-                    self.log_done_counter += 1
-                    self.log_return.append(self.log_episode_return[i].item())
-                    self.log_reshaped_return.append(self.log_episode_reshaped_return[i].item())
-                    self.log_num_frames.append(self.log_episode_num_frames[i].item())
-
-            self.log_episode_return *= self.mask
-            self.log_episode_reshaped_return *= self.mask
-            self.log_episode_num_frames *= self.mask
-
-        # Add advantage and return to experiences
-
-        preprocessed_obs = self.preprocess_obss(self.obs, device=self.device)
-        next_value = self.acmodel(preprocessed_obs, self.memory * self.mask.unsqueeze(1), instr=instr, instr_len=instr_len)['value']
-
-        for i in reversed(range(self.num_frames_per_proc)):
-            next_mask = self.masks[i+1] if i < self.num_frames_per_proc - 1 else self.mask
-            next_value = self.values[i+1] if i < self.num_frames_per_proc - 1 else next_value
-            next_advantage = self.advantages[i+1] if i < self.num_frames_per_proc - 1 else 0
-
-            delta = self.rewards[i] + self.discount * next_value * next_mask - self.values[i]
-            self.advantages[i] = delta + self.discount * self.gae_lambda * next_advantage * next_mask
-
-        # Flatten the data correctly, making sure that
-        # each episode's data is a continuous chunk
-
-        exps = DictList()
-        exps.obs = [self.obss[i][j]
-                    for j in range(self.num_procs)
-                    for i in range(self.num_frames_per_proc)]
-
-        # In commments below T is self.num_frames_per_proc, P is self.num_procs,
-        # D is the dimensionality
-
-        # T x P x D -> P x T x D -> (P * T) x D
-        exps.memory = self.memories.transpose(0, 1).reshape(-1, *self.memories.shape[2:])
-        # T x P -> P x T -> (P * T) x 1
-        exps.mask = self.masks.transpose(0, 1).reshape(-1).unsqueeze(1)
-
-        # for all tensors below, T x P -> P x T -> P * T
-        exps.action = self.actions.transpose(0, 1).reshape(-1)
-        exps.value = self.values.transpose(0, 1).reshape(-1)
-        exps.reward = self.rewards.transpose(0, 1).reshape(-1)
-        exps.advantage = self.advantages.transpose(0, 1).reshape(-1)
-        exps.returnn = exps.value + exps.advantage
-        exps.log_prob = self.log_probs.transpose(0, 1).reshape(-1)
-
-        if self.aux_info:
-            exps = self.aux_info_collector.end_collection(exps)
-
-        # Preprocess experiences
-
-        exps.obs = self.preprocess_obss(exps.obs, device=self.device)
-        # L = sequence length
-        # P x L x D... -> P x 1 x L x D... -> P x T x L x D... (expand) -> (P * T) x L x D
-        exps.instr = instr.unsqueeze(1).expand(-1, self.num_frames_per_proc, -1, -1).reshape(-1, instr.shape[1], instr.shape[2])
-        # P -> P x 1 -> P x T -> P * T
-        exps.instr_len = instr_len.unsqueeze(1).expand(-1, self.num_frames_per_proc).reshape(-1)
+        # T x P x L x D -> P x T x L x D -> (P * T) x L x D
+        exps.instr = torch.stack(self.instrs).transpose(0, 1).reshape(-1, instr.shape[1], instr.shape[2])
+        # T x P -> P x T -> P * T
+        exps.instr_len = torch.stack(self.instrs_lens).transpose(0, 1).reshape(-1)
 
         # Log some values
 

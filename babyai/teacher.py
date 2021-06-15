@@ -95,7 +95,7 @@ class LanguageDecoder(nn.Module):
 
         return logits
 
-    def sample(self, states, max_len=50, greedy=False, uniform_weight=0.0, softmax_temp=1.0):
+    def sample(self, states, max_len=50, greedy=False, uniform_weight=0.0, softmax_temp=1.0, trim=False):
         batch_size = states.shape[0]  # 0th dim is singleton for GRU
         states = states.unsqueeze(0)
         # This contains are series of sampled onehot vectors
@@ -174,8 +174,9 @@ class LanguageDecoder(nn.Module):
             lang_length += (1 - done_sampling)
 
         # Concat tokens and trim
-        max_lang_len = lang_length.max()
-        lang = lang[:, :max_lang_len, :]
+        if trim:
+            max_lang_len = lang_length.max()
+            lang = lang[:, :max_lang_len, :]
 
         return lang, lang_length
 

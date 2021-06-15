@@ -43,9 +43,8 @@ class PPOAlgo(BaseAlgo):
         # assuming fixed student reward func. This means we do backprop on
         # entire batches of instructions, rather than on batches of frames.
         # TODO: probably make batch size/epochs smaller.
-        # FIXME: is it ok that we detach advantages?
         for epoch_i in range(self.epochs):
-            exps, logs = self.collect_experiences_for_teacher()
+            exps, logs = self.collect_experiences('teacher')
             # Initialize log values
 
             #  log_entropies = []
@@ -82,7 +81,7 @@ class PPOAlgo(BaseAlgo):
         self.acmodel.freeze_teacher()
         # Collect experiences
 
-        exps, logs = self.collect_experiences_for_student()
+        exps, logs = self.collect_experiences('student')
         '''
         exps is a DictList with the following keys ['obs', 'memory', 'mask', 'action', 'value', 'reward',
          'advantage', 'returnn', 'log_prob'] and ['collected_info', 'extra_predictions'] if we use aux_info
