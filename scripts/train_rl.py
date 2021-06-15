@@ -142,6 +142,10 @@ else:
               'num_episodes': 0,
               'num_frames': 0}
 
+# Language folder
+lang_folder = os.path.join(utils.get_log_dir(args.model), 'lang')
+os.makedirs(lang_folder, exist_ok=True)
+
 # Define logger and Tensorboard writer and CSV writer
 
 header = (["update", "episodes", "frames", "FPS", "duration"]
@@ -254,6 +258,11 @@ while status['num_frames'] < args.frames:
             )
             assert len(metric_names) == len(data)
             wandb.log(dict(zip(metric_names, data)))
+
+        # Save language
+        lang_df = student_logs["lang"]
+        lang_fname = os.path.join(lang_folder, f"{status['i']}_lang.csv")
+        lang_df.to_csv(lang_fname)
 
         if args.tb:
             assert len(header) == len(data)

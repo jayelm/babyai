@@ -117,6 +117,23 @@ class DemoPreprocessor(object):
         return demo_proc
 
 
+def to_emergent_text(idxs, join=False, eos=None):
+    texts = []
+    for lang in idxs:
+        toks = []
+        for i in lang:
+            i_item = i.item()
+            i = str(i_item)
+            toks.append(i)
+            if eos is not None and i_item == eos:
+                break
+        if join:
+            texts.append(" ".join(toks))
+        else:
+            texts.append(toks)
+    return texts
+
+
 class RawImagePreprocessor(object):
     def __call__(self, obss, device=None):
         images = numpy.array([obs["image"] for obs in obss])

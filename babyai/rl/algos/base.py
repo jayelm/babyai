@@ -2,12 +2,13 @@ from abc import ABC, abstractmethod
 import torch
 import numpy as np
 import contextlib
+import pandas as pd
 
 from babyai.rl.format import default_preprocess_obss
 from babyai.rl.utils import DictList, ParallelEnv
 from babyai.rl.utils.supervised_losses import ExtraInfoCollector
 from babyai.utils.demos import load_demos, mission_to_demos, Demos
-from babyai.utils.format import DemoPreprocessor
+from babyai.utils.format import DemoPreprocessor, to_emergent_text
 
 
 class BaseAlgo(ABC):
@@ -184,11 +185,16 @@ class BaseAlgo(ABC):
         # params are frozen but gradients are calculated all the way
         # through.
         context = torch.no_grad if mode == 'student' else contextlib.nullcontext
+        log_instrs = []
 
         if self.acmodel.gen_instr:
             # Generate instructions, fixing teacher parameters.
             with context():
                 instr, instr_len = self.generate_instructions()
+                # Add to instructions
+                instr_text = to_emergent_text(instr.argmax(2), eos=2, join=True)
+                gt_text = [o["mission"] for o in self.obs]
+                log_instrs.extend(zip(instr_text, gt_text))
         else:
             instr = None
             instr_len = None
@@ -275,6 +281,12 @@ class BaseAlgo(ABC):
                     instr = torch.where(mask_bool.unsqueeze(1).unsqueeze(1), instr, new_instr_padded)
                     instr_len = torch.where(mask_bool, instr_len, new_instr_len_padded)
 
+                    # Log new instructions
+                    new_instr_text = to_emergent_text(new_instr.argmax(2), eos=2, join=True)
+                    new_gt_text = [o["mission"] for o, m in zip(self.obs, mask_bool) if not m]
+                    assert len(new_instr_text) == len(new_gt_text)
+                    log_instrs.extend(zip(new_instr_text, new_gt_text))
+
         # Add advantage and return to experiences
 
         preprocessed_obs = self.preprocess_obss(self.obs, device=self.device)
@@ -329,12 +341,14 @@ class BaseAlgo(ABC):
 
         keep = max(self.log_done_counter, self.num_procs)
 
+        log_instrs_df = pd.DataFrame.from_records(log_instrs, columns=["emergent", "gt"])
         log = {
             "return_per_episode": self.log_return[-keep:],
             "reshaped_return_per_episode": self.log_reshaped_return[-keep:],
             "num_frames_per_episode": self.log_num_frames[-keep:],
             "num_frames": self.num_frames,
             "episodes_done": self.log_done_counter,
+            "lang": log_instrs_df,
         }
 
         self.log_done_counter = 0
